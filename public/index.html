@@ -1,0 +1,210 @@
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const { Server } = require('socket.io');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+const PORT = process.env.PORT || 3000;
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const ARENA_HALF = 18;
+const MAX_HEALTH = 100;
+const MOVE_SPEED = 9.5;
+const ATTACK_RANGE = 2.6;
+const ATTACK_COOLDOWN = 0.42;
+const HIT_DAMAGE = 16;
+
+app.use(express.static(PUBLIC_DIR));
+
+const players = new Map();
+
+function randomColor() {
+  const palette = ['#ff6b6b', '#4ecdc4', '#ffd166', '#7bdff2', '#b892ff', '#8bd17c'];
+  return palette[Math.floor(Math.random() * palette.length)];
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function getSpawnPoint(index) {
+  const angle = (index * Math.PI) / 2;
+  const radius = 7.5;
+  return {
+    x: Math.cos(angle) * radius,
+    z: Math.sin(angle) * radius
+  };
+}
+
+function makePlayer(id, name, index = 0) {
+  const spawn = getSpawnPoint(index);
+  return {
+    id,
+    name,
+    x: spawn.x,
+    y: 0,
+    z: spawn.z,
+    rotation: 0,
+    health: MAX_HEALTH,
+    alive: true,
+    score: 0,
+    color: randomColor(),
+    attackCooldown: 0,
+    input: { up: false, down: false, left: false, right: false, attack: false }
+  };
+}
+
+function serializePlayer(player) {
+  return {
+    id: player.id,
+    name: player.name,
+    x: player.x,
+    y: player.y,
+    z: player.z,
+    rotation: player.rotation,
+    health: player.health,
+    alive: player.alive,
+    color: player.color,
+    score: player.score
+  };
+}
+
+function applyInput(player, delta) {
+  if (!player.alive) return;
+
+  let dx = 0;
+  let dz = 0;
+
+  if (player.input.up) dz -= 1;
+  if (player.input.down) dz += 1;
+  if (player.input.left) dx -= 1;
+  if (player.input.right) dx += 1;
+
+  if (dx !== 0 || dz !== 0) {
+    const len = Math.hypot(dx, dz) || 1;
+    dx /= len;
+    dz /= len;
+
+    player.x += dx * MOVE_SPEED * delta;
+    player.z += dz * MOVE_SPEED * delta;
+
+    player.rotation = Math.atan2(dx, dz);
+  }
+
+  player.x = clamp(player.x, -ARENA_HALF, ARENA_HALF);
+  player.z = clamp(player.z, -ARENA_HALF, ARENA_HALF);
+
+  if (player.attackCooldown > 0) {
+    player.attackCooldown = Math.max(0, player.attackCooldown - delta);
+  }
+
+  if (player.input.attack && player.attackCooldown <= 0) {
+    player.attackCooldown = ATTACK_COOLDOWN;
+    performAttack(player.id);
+  }
+}
+
+function performAttack(attackerId) {
+  const attacker = players.get(attackerId);
+  if (!attacker || !attacker.alive) return;
+
+  for (const [targetId, target] of players.entries()) {
+    if (targetId === attackerId || !target.alive) continue;
+
+    const dx = target.x - attacker.x;
+    const dz = target.z - attacker.z;
+    const distance = Math.hypot(dx, dz);
+
+    if (distance <= ATTACK_RANGE) {
+      target.health = Math.max(0, target.health - HIT_DAMAGE);
+
+      io.emit('hit', {
+        attackerId,
+        targetId,
+        damage: HIT_DAMAGE,
+        targetHealth: target.health,
+        targetAlive: target.health > 0
+      });
+
+      if (target.health <= 0) {
+        target.alive = false;
+        attacker.score += 1;
+        io.emit('systemMessage', `${attacker.name} eliminated ${target.name}!`);
+      }
+    }
+  }
+}
+
+function resetPlayer(player) {
+  const spawn = getSpawnPoint(Math.floor(Math.random() * 4));
+  player.x = spawn.x;
+  player.z = spawn.z;
+  player.health = MAX_HEALTH;
+  player.alive = true;
+  player.attackCooldown = 0;
+}
+
+io.on('connection', (socket) => {
+  const index = players.size;
+  const player = makePlayer(socket.id, `Fighter-${Math.floor(Math.random() * 900 + 100)}`, index);
+  players.set(socket.id, player);
+
+  socket.emit('welcome', {
+    id: socket.id,
+    name: player.name,
+    arenaHalf: ARENA_HALF
+  });
+
+  io.emit('systemMessage', `${player.name} joined the arena.`);
+  io.emit('playerList', Array.from(players.values()).map(serializePlayer));
+
+  socket.on('input', (input) => {
+    const current = players.get(socket.id);
+    if (!current) return;
+
+    current.input = {
+      up: !!input.up,
+      down: !!input.down,
+      left: !!input.left,
+      right: !!input.right,
+      attack: !!input.attack
+    };
+  });
+
+  socket.on('respawn', () => {
+    const current = players.get(socket.id);
+    if (!current) return;
+    resetPlayer(current);
+    io.emit('systemMessage', `${current.name} respawned.`);
+  });
+
+  socket.on('disconnect', () => {
+    const removed = players.get(socket.id);
+    if (removed) {
+      io.emit('systemMessage', `${removed.name} left the arena.`);
+    }
+    players.delete(socket.id);
+    io.emit('playerList', Array.from(players.values()).map(serializePlayer));
+  });
+});
+
+const TICK_RATE = 60;
+const FRAME_TIME = 1 / TICK_RATE;
+
+setInterval(() => {
+  for (const player of players.values()) {
+    applyInput(player, FRAME_TIME);
+  }
+
+  io.emit('state', Array.from(players.values()).map(serializePlayer));
+}, 1000 / TICK_RATE);
+
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
+
+server.listen(PORT, () => {
+  console.log(`Arena duel server is running on http://localhost:${PORT}`);
+});
